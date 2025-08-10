@@ -1,6 +1,7 @@
 #include <iostream>
 #include <signal.h>
 #include <unistd.h>
+#include <string>
 #include "ServerSocket.h"
 
 // Global server pointer for signal handling
@@ -18,7 +19,7 @@ void signalHandler(int signum) {
 }
 
 int main(int argc, char* argv[]) {
-    std::string ip = "127.0.0.1";// Default IP
+    std::string ip = "127.0.0.1";  // Default IP
     int port = 8080;  // Default port
 
     // Parse command line arguments
@@ -31,10 +32,13 @@ int main(int argc, char* argv[]) {
             std::cerr << "Error: Port number must be between 1 and 65535." << std::endl;
             return 1;
         }
-    }else{
-        std::cout<<"Enter port number (default 8080):";
+    }
+    else {
+        // If no command line arguments, prompt user to input port
+        std::cout << "Enter port number (default: 8080): ";
         std::string portInput;
         std::getline(std::cin, portInput);
+
         if (!portInput.empty()) {
             port = std::atoi(portInput.c_str());
             if (port <= 0 || port > 65535) {
@@ -43,15 +47,17 @@ int main(int argc, char* argv[]) {
             }
         }
     }
+
     // Print welcome information
     std::cout << "=== Linux Server - Qt Client Test ===" << std::endl;
     std::cout << "IP: " << ip << std::endl;
     std::cout << "Port: " << port << std::endl;
     std::cout << "Supported commands:" << std::endl;
-    std::cout << "  100 - Text Message" << std::endl;
-    std::cout << "  101 - File Begin" << std::endl;   // Fixed spelling: filebegain ¡ú filebegin
-    std::cout << "  102 - File Data" << std::endl;
-    std::cout << "  103 - File End" << std::endl;
+    std::cout << "  1 - Text Message" << std::endl;
+    std::cout << "  2 - File Start" << std::endl;
+    std::cout << "  3 - File Data" << std::endl;
+    std::cout << "  4 - File Complete" << std::endl;
+    std::cout << "  1981 - Test Connect" << std::endl;
     std::cout << "Press Ctrl+C to exit" << std::endl;  // More intuitive description
     std::cout << "=====================================" << std::endl;
 
@@ -60,7 +66,7 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, signalHandler);
 
     // Create and start server
-    CServerSocket server(ip,port);
+    CServerSocket server(ip, port);
     g_server = &server;
 
     if (!server.start()) {

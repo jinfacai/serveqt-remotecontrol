@@ -46,7 +46,6 @@ public:
 
     // 设置命令
     void setCmd(uint16_t cmd);
-#pragma pack(1)
 
 private:
     uint16_t sHead;     // 2字节 - 包头标识 0xFEFF

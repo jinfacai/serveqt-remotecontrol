@@ -1,10 +1,14 @@
 #include "ServerSocket.h"
 #include "Packet.h"
+#include "Command.h"
 #include <vector>
 
-CServerSocket::CServerSocket(const std::string& ip,int port)
-    :m_ip(ip) , m_port(port), m_epollFd(-1), m_listenFd(-1), m_running(false), m_nextClientId(1)
+CServerSocket::CServerSocket(const std::string& ip, int port)
+    :m_ip(ip), m_port(port), m_epollFd(-1), m_listenFd(-1), m_running(false), m_nextClientId(1)
 {
+    m_command = std::unique_ptr<CCommand>(new CCommand()); //创建command
+    // 设置Command类的ServerSocket指针
+    m_command->setServerSocket(this);
 }
 
 CServerSocket::~CServerSocket() {
@@ -25,23 +29,32 @@ void CServerSocket::stop() {
         return;
     }
     m_running = false;
-    // Close all client connections
-    for (auto& pair : m_clients) {
+
+    // 关闭所有客户端连接
+    auto& clientManager = m_command->getClientManager();
+    for (const auto& pair : clientManager.getAllClients()) {
         close(pair.second.socket);
     }
-    m_clients.clear();
-    m_clientIdMap.clear();
-    // Close listener
+
+    // 关闭监听socket
     if (m_listenFd != -1) {
         close(m_listenFd);
         m_listenFd = -1;
     }
-    // Close epoll
+    // 关闭epoll
     if (m_epollFd != -1) {
         close(m_epollFd);
         m_epollFd = -1;
     }
     log("Server has stopped");
+}
+
+int CServerSocket::getClientCount() const {
+    return m_command->getClientManager().getClientCount();
+}
+
+CCommand* CServerSocket::getCommand() {
+    return m_command.get();
 }
 
 void CServerSocket::run() {
@@ -83,149 +96,106 @@ void CServerSocket::handleClientData(int clientSocket) {
         else {
             log("Data reception error: " + std::string(strerror(errno)));
         }
-        handleClientDisconnect(clientSocket); // Fixed spelling: Disconnet → Disconnect
+        handleClientDisconnect(clientSocket);
         return;
     }
-    // Add data to receive buffer
-    //auto& client = m_clients[clientSocket];
-    auto it = m_clients.find(clientSocket);
-    if (it == m_clients.end()) {
-        log("Client not found in map, socket: " + std::to_string(clientSocket));
-        return;
-    }
-    auto& client = it->second;
-    client.receiverBuffer.append(buffer, bytesRead);
-    log("Received " + std::to_string(bytesRead) + " bytes from client " + std::to_string(client.id));
 
-    while (client.receiverBuffer.size() >= 8) { // Minimum packet size
-        size_t remainingSize = client.receiverBuffer.size();
-        log("Processing buffer of size: " + std::to_string(remainingSize));
-        CPacket packet(reinterpret_cast<const uint8_t*>(client.receiverBuffer.data()), remainingSize);
-        if (remainingSize == 0) {
-            log("Failed to parse data, continuing to try");
-            client.receiverBuffer.erase(0, 1);
-            continue;
+    // 将数据添加到ClientManager的缓冲区
+    auto& clientManager = m_command->getClientManager();
+    int clientId = clientManager.getClientIdBySocket(clientSocket);
+    if (clientId != -1) {
+        clientManager.appendToBuffer(clientId, std::string(buffer, bytesRead));
+        log("Received " + std::to_string(bytesRead) + " bytes from client " + std::to_string(clientId));
+
+        // 处理缓冲区中的数据包
+        std::string receiverBuffer = clientManager.getBuffer(clientId);
+        while (receiverBuffer.size() >= 8) { // Minimum packet size
+            size_t remainingSize = receiverBuffer.size();
+            log("Processing buffer of size: " + std::to_string(remainingSize));
+
+            CPacket packet(reinterpret_cast<const uint8_t*>(receiverBuffer.data()), remainingSize);
+            if (remainingSize == 0) {
+                log("Failed to parse data, continuing to try");
+                receiverBuffer.erase(0, 1);
+                continue;
+            }
+            log("Successfully parsed packet, cmd: " + std::to_string(packet.getCmd()) +
+                ", data size: " + std::to_string(packet.getData().size()));
+
+            // 移除已处理的数据包数据
+            int processedSize = receiverBuffer.size() - remainingSize;
+            if (processedSize > 0) {
+                receiverBuffer.erase(0, processedSize);
+                log("Removed " + std::to_string(processedSize) + " bytes from buffer");
+            }
+
+            // 处理数据包
+            handlePacket(clientSocket, packet);
         }
-        log("Successfully parsed packet, cmd: " + std::to_string(packet.getCmd()) +
-            ", data size: " + std::to_string(packet.getData().size()));
-        // Remove processed packet data
-        int processedSize = client.receiverBuffer.size() - remainingSize;
-        if (processedSize > 0) {
-            client.receiverBuffer.erase(0, processedSize);
-            log("Removed " + std::to_string(processedSize) + " bytes from buffer");
-        }
-        // Process the packet
-        handlePacket(clientSocket, packet);
+
+        // 更新缓冲区
+        clientManager.clearBuffer(clientId);
+        clientManager.appendToBuffer(clientId, receiverBuffer);
     }
 }
 
 void CServerSocket::handlePacket(int clientSocket, const CPacket& packet) {
-   // auto& client = m_clients[clientSocket];
-    auto it = m_clients.find(clientSocket);
-    if (it == m_clients.end()) {
-        log("Client not found in map for packet handling, socket: " + std::to_string(clientSocket));
+    auto& clientManager = m_command->getClientManager();
+    int clientId = clientManager.getClientIdBySocket(clientSocket);
+    if (clientId == -1) {
+        log("Client not found for packet handling, socket: " + std::to_string(clientSocket));
         return;
     }
-    auto& client = it->second;
-    log("Received packet from client " + std::to_string(client.id) + ": " +
+
+    log("Received packet from client " + std::to_string(clientId) + ": " +
         "Command=" + std::to_string(packet.getCmd()) +
         ", Data=" + packet.getData());
 
-    // Handle based on command
-    switch (packet.getCmd()) {
-    case 100: // Text message
-    {
-        std::string textData = packet.getData();
-        log("Client " + std::to_string(client.id) + " sent text: " + textData);
+    // 将命令处理完全交给 CCommand 类，传递clientId
+    std::list<CPacket> outPackets;
+    CPacket packetCopy = packet;  // 创建副本以避免const问题
+    int result = m_command->ExecuteCommand(packet.getCmd(), outPackets, packetCopy, clientId);
 
-        // Broadcast text message to all clients
-        std::string broadcastText = "Client " + std::to_string(client.id) + " says: " + textData;
-        CPacket broadcastPacket = createResponsePacket(100, broadcastText);
-        this->broadcastPacket(broadcastPacket);
+    if (result != 0) {
+        log("Command execution failed for cmd: " + std::to_string(packet.getCmd()));
     }
-    break;
 
-    case 101: // File begin
-    {
-        std::string fileName = packet.getData();
-        log("Client " + std::to_string(client.id) + " started sending file: " + fileName);
-
-        // Send confirmation message
-        std::string ackMsg = "Server received file start notification: " + fileName;
-        CPacket ackPacket = createResponsePacket(100, ackMsg);
-        sendPacketToClient(client.id, ackPacket);
-    }
-    break;
-
-    case 102: // File data
-    {
-        size_t dataSize = packet.getData().size();
-        log("Client " + std::to_string(client.id) + " sent file data chunk: " +
-            std::to_string(dataSize) + " bytes");
-
-        // Send confirmation message
-        std::string ackMsg = "Server received file data chunk: " + std::to_string(dataSize) + " bytes";
-        CPacket ackPacket = createResponsePacket(100, ackMsg);
-        sendPacketToClient(client.id, ackPacket);
-    }
-    break;
-
-    case 103: // File end
-    {
-        log("Client " + std::to_string(client.id) + " finished sending file");
-
-        // Send confirmation message
-        std::string ackMsg = "Server received file end notification";
-        CPacket ackPacket = createResponsePacket(100, ackMsg);
-        sendPacketToClient(client.id, ackPacket);
-    }
-    break;
-
-    default:
-    {
-        std::string unknownCmd = "Unknown command: " + std::to_string(packet.getCmd());
-        log("Received unknown command: " + std::to_string(packet.getCmd()));
-        CPacket response = createResponsePacket(100, unknownCmd);
-        sendPacketToClient(client.id, response);
-    }
-    break;
+    // 发送 CCommand 生成的响应包
+    for (const auto& outPacket : outPackets) {
+        // 广播给所有客户端
+        for (const auto& clientPair : clientManager.getAllClients()) {
+            if (clientPair.second.isConnected) {
+                sendPacketToClient(clientPair.second.id, outPacket);
+            }
+        }
     }
 }
 
-CPacket CServerSocket::createResponsePacket(uint16_t cmd, const std::string& data) {
-    return CPacket(cmd, reinterpret_cast<const uint8_t*>(data.data()), data.size());
-}
-
-void CServerSocket::handleClientDisconnect(int clientSocket) { // Fixed spelling: Disconnet → Disconnect
+void CServerSocket::handleClientDisconnect(int clientSocket) {
     log("Handling client disconnect for socket: " + std::to_string(clientSocket));
-    auto it = m_clients.find(clientSocket);
-    // If client not found
-    if (it != m_clients.end()) {
-        //log("Client disconnected: ID=" + std::to_string(it->second.id) +
-        //    ", IP=" + it->second.ip);
-        int clientId = it->second.id;
-        log("Client disconnected: ID=" + std::to_string(clientId) +
-            ", IP=" + it->second.ip + ", Socket=" + std::to_string(clientSocket));
-        m_clientIdMap.erase(clientId);
-        //log("Removing client from map: socket=" + std::to_string(clientSocket));
-        m_clients.erase(it);
-        log("Successfully removed client from maps. New size: " + std::to_string(m_clients.size()));
+
+    auto& clientManager = m_command->getClientManager();
+    int clientId = clientManager.getClientIdBySocket(clientSocket);
+    if (clientId != -1) {
+        log("Client disconnected: ID=" + std::to_string(clientId) + ", Socket=" + std::to_string(clientSocket));
+
+        // 通知Command类移除客户端
+        m_command->removeClient(clientId);
+
+        log("Successfully removed client from ClientManager. New size: " + std::to_string(clientManager.getClientCount()));
     }
     else {
-        log("WARNING: Client socket " + std::to_string(clientSocket) + " not found in m_clients");
+        log("WARNING: Client socket " + std::to_string(clientSocket) + " not found in ClientManager");
     }
     removeClientFromEpoll(clientSocket);
-   // close(clientSocket);
-    //关闭套接字
+
     if (close(clientSocket) == -1) {
         log("Failed to close socket " + std::to_string(clientSocket) + ": " + std::string(strerror(errno)));
     }
     else {
         log("Successfully closed socket " + std::to_string(clientSocket));
     }
-
 }
-
 
 void CServerSocket::removeClientFromEpoll(int clientSocket) {
     if (epoll_ctl(m_epollFd, EPOLL_CTL_DEL, clientSocket, nullptr) == -1) {
@@ -236,183 +206,152 @@ void CServerSocket::removeClientFromEpoll(int clientSocket) {
 void CServerSocket::handleNewConnection() {
     struct sockaddr_in clientAddr;
     socklen_t clientLen = sizeof(clientAddr);
+
     // Accept client connection
     int clientSocket = accept(m_listenFd, (struct sockaddr*)&clientAddr, &clientLen);
     if (clientSocket == -1) {
         log("Failed to accept connection: " + std::string(strerror(errno)));
         return;
     }
-    // Check client limit
-    if (m_clients.size() >= MAX_CLIENTS) {
-        log("Client limit reached, connection rejected");
-        close(clientSocket);
-        return;
-    }
-    // Set non-blocking mode
+
+    // 设置非阻塞
     setNonBlocking(clientSocket);
-    // Add to epoll
+
+    // 添加到epoll
     addClientToEpoll(clientSocket);
-    // Create client info
-    ClientInfo client;
-    client.socket = clientSocket;
-    client.id = m_nextClientId++;
-    client.ip = inet_ntoa(clientAddr.sin_addr);
-    client.port = ntohs(clientAddr.sin_port);
-    client.isConnected = true;
-    client.receiverBuffer.clear();
-    //m_clients[clientSocket] = client;
-    //检查客户端数量限制
-    if (m_clients.size() >= MAX_CLIENTS) {
-        log("Client limit reached, connection rejected");
-        close(clientSocket);
-        return;
-    }
-    //检查套接字是否已经存在
-    if (m_clients.find(clientSocket) != m_clients.end()) {
-        log("Error: Socket" + std::to_string(clientSocket) + "already exists in m_clients!");
-        close(clientSocket);
-        return;
-    }
-    //插入客户端
-    log("Attempting to insert client with socket: " + std::to_string(clientSocket));
-    log("Current map size before insert: " + std::to_string(m_clients.size()));
 
-    auto result = m_clients.insert(std::make_pair(clientSocket, client));
-    if (!result.second) {
-        log("Failed to insert client into map");
-        close(clientSocket);
-        return;
-    }
-    log("Successfully inserted client. New map size: " + std::to_string(m_clients.size()));
+    // 获取客户端IP和端口
+    char clientIP[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &clientAddr.sin_addr, clientIP, INET_ADDRSTRLEN);
+    int clientPort = ntohs(clientAddr.sin_port);
 
-    m_clientIdMap[client.id] = clientSocket;
-    log("New client connected: ID=" + std::to_string(client.id) +
-       ", IP=" + client.ip + ", Port=" + std::to_string(client.port));
- 
+    // 分配客户端ID
+    int clientId = m_nextClientId++;
+
+    // 通过Command类添加客户端到ClientManager
+    m_command->addClient(clientSocket, clientId, std::string(clientIP), clientPort);
+
+    log("New client connected: Socket=" + std::to_string(clientSocket) +
+        ", ID=" + std::to_string(clientId) +
+        ", IP=" + std::string(clientIP) +
+        ", Port=" + std::to_string(clientPort));
 }
-
 
 void CServerSocket::addClientToEpoll(int clientSocket) {
     struct epoll_event event;
-    event.events = EPOLLIN | EPOLLET; // Edge-triggered mode
+    event.events = EPOLLIN | EPOLLET; // Edge-triggered
     event.data.fd = clientSocket;
+
     if (epoll_ctl(m_epollFd, EPOLL_CTL_ADD, clientSocket, &event) == -1) {
         log("Failed to add client to epoll: " + std::string(strerror(errno)));
+        close(clientSocket);
+        return;
     }
 }
 
 bool CServerSocket::initialize() {
-    log("Starting server initialization...");
-    // Create socket
+    // 创建监听socket
     m_listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (m_listenFd == -1) {
         log("Failed to create socket: " + std::string(strerror(errno)));
         return false;
     }
-    log("Socket created successfully, file descriptor: " + std::to_string(m_listenFd));
-    // Set socket options
+
+    // 设置socket选项
     int opt = 1;
     if (setsockopt(m_listenFd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) == -1) {
-        log("Failed to set socket options: " + std::string(strerror(errno)));
+        log("Failed to set socket option: " + std::string(strerror(errno)));
         close(m_listenFd);
         return false;
     }
-    // Set to non-blocking mode
-    setNonBlocking(m_listenFd);
 
+    // 绑定地址
     struct sockaddr_in serverAddr;
-    memset(&serverAddr, 0, sizeof(serverAddr));
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serverAddr.sin_addr.s_addr = inet_addr(m_ip.c_str());
     serverAddr.sin_port = htons(m_port);
-    // Bind address
+
     if (bind(m_listenFd, (struct sockaddr*)&serverAddr, sizeof(serverAddr)) == -1) {
-        log("Failed to bind address: " + std::string(strerror(errno)));
+        log("Failed to bind: " + std::string(strerror(errno)));
         close(m_listenFd);
         return false;
     }
-    // Start listening
+
+    // 监听连接
     if (listen(m_listenFd, SOMAXCONN) == -1) {
         log("Failed to listen: " + std::string(strerror(errno)));
         close(m_listenFd);
         return false;
     }
-    // Create epoll
+
+    // 创建epoll实例
     m_epollFd = epoll_create1(0);
     if (m_epollFd == -1) {
         log("Failed to create epoll: " + std::string(strerror(errno)));
         close(m_listenFd);
         return false;
     }
-    log("Epoll created successfully, file descriptor: " + std::to_string(m_epollFd));
 
-    // Add listening socket to epoll
+    // 添加监听socket到epoll
     struct epoll_event event;
     event.events = EPOLLIN;
     event.data.fd = m_listenFd;
+
     if (epoll_ctl(m_epollFd, EPOLL_CTL_ADD, m_listenFd, &event) == -1) {
-        log("Failed to add listening socket to epoll: " + std::string(strerror(errno)));
+        log("Failed to add listen socket to epoll: " + std::string(strerror(errno)));
         close(m_epollFd);
         close(m_listenFd);
         return false;
     }
-    log("Listening socket added to epoll");
-    log("Server initialization completed");
+
+    // 设置非阻塞
+    setNonBlocking(m_listenFd);
+
     return true;
 }
 
 void CServerSocket::setNonBlocking(int fd) {
-    // Get current flags
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags == -1) {
-        log("Failed to get file descriptor flags: " + std::string(strerror(errno)));
+        log("Failed to get socket flags: " + std::string(strerror(errno)));
         return;
     }
-    // Add non-blocking flag
-    flags |= O_NONBLOCK;
-    if (fcntl(fd, F_SETFL, flags) == -1) {
-        log("Failed to set non-blocking mode: " + std::string(strerror(errno)));
-        return;
+    if (fcntl(fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        log("Failed to set socket non-blocking: " + std::string(strerror(errno)));
     }
 }
 
 void CServerSocket::log(const std::string message) const {
-    std::cout << "[Server] " << message << std::endl;
-}
-
-
-void CServerSocket::broadcastPacket(const CPacket& packet) {
-    for (const auto& clientPair : m_clients) {
-        const auto& client = clientPair.second;
-        if (client.isConnected) {
-            sendPacketToClient(client.id, packet);
-        }
-    }
+    std::cout << "[ServerSocket] " << message << std::endl;
 }
 
 bool CServerSocket::sendPacketToClient(int clientId, const CPacket& packet) {
-    auto it = m_clientIdMap.find(clientId);
-    if (it == m_clientIdMap.end()) {
-        log("Client ID does not exist: " + std::to_string(clientId));
+    auto& clientManager = m_command->getClientManager();
+    int clientSocket = clientManager.getSocketByClientId(clientId);
+    if (clientSocket == -1) {
+        log("Client not found for sending packet: " + std::to_string(clientId));
         return false;
     }
-    int clientSocket = it->second;
-    const char* data = packet.Data();
-    int size = packet.Size();
 
-    ssize_t bytesSent = send(clientSocket, data, size, 0);
+    // 序列化数据包
+    const char* packetData = packet.Data();
+    int packetSize = packet.Size();
+    ssize_t bytesSent = send(clientSocket, packetData, packetSize, 0);
+
     if (bytesSent == -1) {
-        log("Failed to send data: " + std::string(strerror(errno)));
+        log("Failed to send packet to client " + std::to_string(clientId) +
+            ": " + std::string(strerror(errno)));
         return false;
     }
-    if (bytesSent != size) {
-        log("Incomplete data sent: " + std::to_string(bytesSent) + "/" + std::to_string(size));
-        return false;
-    }
-    log("Sent packet to client " + std::to_string(clientId) + ": " +
-        "Command=" + std::to_string(packet.getCmd()) +
-        ", Size=" + std::to_string(size) + " bytes");
 
+    if (bytesSent != static_cast<ssize_t>(packetSize)) {
+        log("Partial send to client " + std::to_string(clientId) +
+            ": " + std::to_string(bytesSent) + "/" + std::to_string(packetSize));
+        return false;
+    }
+
+    log("Successfully sent packet to client " + std::to_string(clientId) +
+        ", bytes: " + std::to_string(bytesSent) + "/" + std::to_string(packetSize));
     return true;
 }
 
