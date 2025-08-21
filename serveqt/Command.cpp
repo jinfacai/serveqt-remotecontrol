@@ -18,12 +18,12 @@ CCommand::CCommand() : m_serverSocket(nullptr) {
 	}
 }
 
-int CCommand::ExecuteCommand(int nCmd, std::list<CPacket>& lstPacket, CPacket& inPacket, int clientId) {
+int CCommand::ExecuteCommand(int nCmd, std::list<CPacket>& lstPacket, PacketQueue& packetQueue, CPacket& inPacket, int clientId) {
 	auto it = m_mapFunction.find(nCmd);
 	if (it == m_mapFunction.end()) {
 		return -1;
 	}
-	return(this->*(it->second))(lstPacket, inPacket, clientId);
+	return(this->*(it->second))(lstPacket, packetQueue, inPacket, clientId);
 }
 
 // 客户端管理方法
@@ -65,8 +65,8 @@ void CCommand::sendSystemMessage(const std::string& message, int excludeClientId
 	broadcastPacket(systemPacket, excludeClientId);
 }
 
-// 处理聊天消息
-int CCommand::handleTextMessage(std::list<CPacket>& lstPacket, CPacket& inPacket, int clientId) {
+// 处理聊天消息 - 支持同步和异步双重处理
+int CCommand::handleTextMessage(std::list<CPacket>& lstPacket, PacketQueue& packetQueue, CPacket& inPacket, int clientId) {
 	std::string rawData = inPacket.getData();
 	if (rawData.empty()) {
 		std::cerr << "chat message content is empty" << std::endl;
@@ -81,22 +81,28 @@ int CCommand::handleTextMessage(std::list<CPacket>& lstPacket, CPacket& inPacket
 
 		// 创建新的消息包
 		CPacket newPacket(static_cast<int>(Type::TEXT_MESSAGE), reinterpret_cast<const uint8_t*>(fullMessage.c_str()), fullMessage.size());
+
+		// 同步处理：添加到lstPacket用于立即发送
 		lstPacket.push_back(newPacket);
+
+		// 异步处理：添加到packetQueue用于高并发场景
+		packetQueue.push(static_cast<size_t>(Type::TEXT_MESSAGE), newPacket);
 	}
 	else {
 		// 如果没有找到客户端信息，直接转发原包
 		lstPacket.push_back(inPacket);
+		packetQueue.push(static_cast<size_t>(Type::TEXT_MESSAGE), inPacket);
 	}
 
 	std::cout << "Forward chat messages from client " << clientId << ": " << rawData << std::endl;
 	return 0;
 }
 
-// 文件首包 仅含filename
-int CCommand::handleFileStart(std::list<CPacket>& lstPacket, CPacket& inPacket, int clientId) {
+// 文件首包 仅含filename - 支持同步和异步双重处理
+int CCommand::handleFileStart(std::list<CPacket>& lstPacket, PacketQueue& packetQueue, CPacket& inPacket, int clientId) {
 	const std::string filename = inPacket.getData();
 	if (filename.empty()) {
-		std::cerr << "The file name is empty" << std::endl;
+		std::cerr << "Command.cpp: " << "The file name is empty" << std::endl;
 		return -1;
 	}
 
@@ -107,43 +113,74 @@ int CCommand::handleFileStart(std::list<CPacket>& lstPacket, CPacket& inPacket, 
 		std::string fullMessage = senderInfo + "started file transfer: " + filename;
 
 		CPacket newPacket(static_cast<int>(Type::TEXT_MESSAGE), reinterpret_cast<const uint8_t*>(fullMessage.c_str()), fullMessage.size());
+
+		// 同步处理：通知消息立即发送
 		lstPacket.push_back(newPacket);
+
+		// 异步处理：添加到packetQueue用于高并发场景
+		packetQueue.push(static_cast<size_t>(Type::TEXT_MESSAGE), newPacket);
 	}
 
 	std::cout << "Client " << clientId << " started file transfer: " << filename << std::endl;
+
+	// 同步处理：文件开始包立即发送
 	lstPacket.push_back(inPacket);
+
+	// 异步处理：添加到packetQueue用于高并发场景
+	packetQueue.push(static_cast<size_t>(Type::FILE_START), inPacket);
 	return 0;
 }
 
-// 中间数据
-int CCommand::handleFileData(std::list<CPacket>& lstPacket, CPacket& inPacket, int clientId) {
+// 中间数据 - 支持同步和异步双重处理
+int CCommand::handleFileData(std::list<CPacket>& lstPacket, PacketQueue& packetQueue, CPacket& inPacket, int clientId) {
 	const std::string& chunk = inPacket.getData();
 	std::cout << "Client " << clientId << " file data chunk size: " << chunk.size() << std::endl;
+
+	// 同步处理：文件数据包立即发送
 	lstPacket.push_back(inPacket);
+
+	// 异步处理：添加到packetQueue用于高并发场景
+	packetQueue.push(static_cast<size_t>(Type::FILE_DATA), inPacket);
 	return 0;
 }
 
-int CCommand::handleFileComplete(std::list<CPacket>& lstPacket, CPacket& inPacket, int clientId) {
+int CCommand::handleFileComplete(std::list<CPacket>& lstPacket, PacketQueue& packetQueue, CPacket& inPacket, int clientId) {
 	const ClientInfo* client = m_clientManager.getClient(clientId);
 	if (client) {
 		std::string senderInfo = "[" + std::to_string(clientId) + "] ";
 		std::string fullMessage = senderInfo + " file transfer completed";
 
 		CPacket newPacket(static_cast<int>(Type::TEXT_MESSAGE), reinterpret_cast<const uint8_t*>(fullMessage.c_str()), fullMessage.size());
+
+		// 同步处理：通知消息立即发送
 		lstPacket.push_back(newPacket);
+
+		// 异步处理：添加到packetQueue用于高并发场景
+		packetQueue.push(static_cast<size_t>(Type::TEXT_MESSAGE), newPacket);
 	}
 
 	std::cout << "Client " << clientId << " file transfer completed" << std::endl;
+
+	// 同步处理：文件完成包立即发送
 	lstPacket.push_back(inPacket);
+
+	// 异步处理：添加到packetQueue用于高并发场景
+	packetQueue.push(static_cast<size_t>(Type::FILE_COMPLETE), inPacket);
 	return 0;
 }
 
-// 处理测试连接
-int CCommand::handleTestConnect(std::list<CPacket>& lstPacket, CPacket& inPacket, int clientId) {
+// 处理测试连接 - 支持同步和异步双重处理
+int CCommand::handleTestConnect(std::list<CPacket>& lstPacket, PacketQueue& packetQueue, CPacket& inPacket, int clientId) {
 	// 返回简单的OK消息
 	std::string okMsg = "OK";
-	lstPacket.emplace_back(static_cast<int>(Type::TEST_CONNECT),
+	CPacket okPacket(static_cast<int>(Type::TEST_CONNECT),
 		reinterpret_cast<const uint8_t*>(okMsg.data()), okMsg.size());
+
+	// 同步处理：测试连接响应立即发送
+	lstPacket.push_back(okPacket);
+
+	// 异步处理：添加到packetQueue用于高并发场景
+	packetQueue.push(static_cast<size_t>(Type::TEST_CONNECT), okPacket);
 
 	std::cout << "Test connect successfully from client " << clientId << std::endl;
 	return 0;

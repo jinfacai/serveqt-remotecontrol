@@ -152,21 +152,60 @@ void CServerSocket::handlePacket(int clientSocket, const CPacket& packet) {
         ", Data=" + packet.getData());
 
     // 将命令处理完全交给 CCommand 类，传递clientId
-    std::list<CPacket> outPackets;
-    CPacket packetCopy = packet;  // 创建副本以避免const问题
-    int result = m_command->ExecuteCommand(packet.getCmd(), outPackets, packetCopy, clientId);
+    std::list<CPacket> lstPacket;      // 同步处理结果
+    PacketQueue packetQueue;            // 异步处理队列
+    CPacket packetCopy = packet;        // 创建副本以避免const问题
+
+    int result = m_command->ExecuteCommand(packet.getCmd(), lstPacket, packetQueue, packetCopy, clientId);
 
     if (result != 0) {
         log("Command execution failed for cmd: " + std::to_string(packet.getCmd()));
     }
 
-    // 发送 CCommand 生成的响应包
-    for (const auto& outPacket : outPackets) {
+    // 同步处理：立即发送lstPacket中的包（实时响应）
+    for (const auto& outPacket : lstPacket) {
         // 广播给所有客户端
         for (const auto& clientPair : clientManager.getAllClients()) {
             if (clientPair.second.isConnected) {
                 sendPacketToClient(clientPair.second.id, outPacket);
             }
+        }
+    }
+
+    // 2. 异步处理：处理packetQueue中的包（高并发场景）
+    PacketQueueItem queueItem;
+    while (packetQueue.pop(queueItem)) {
+        // 根据操作类型决定发送策略
+        switch (queueItem.nOperator) {
+        case static_cast<size_t>(CCommand::Type::FILE_START):
+        case static_cast<size_t>(CCommand::Type::FILE_DATA):
+        case static_cast<size_t>(CCommand::Type::FILE_COMPLETE):
+            // 文件传输包：广播给所有客户端
+            for (const auto& clientPair : clientManager.getAllClients()) {
+                if (clientPair.second.isConnected) {
+                    sendPacketToClient(clientPair.second.id, queueItem.Data);
+                }
+            }
+            break;
+
+        case static_cast<size_t>(CCommand::Type::TEXT_MESSAGE):
+        case static_cast<size_t>(CCommand::Type::TEST_CONNECT):
+            // 文本消息和测试连接：广播给所有客户端
+            for (const auto& clientPair : clientManager.getAllClients()) {
+                if (clientPair.second.isConnected) {
+                    sendPacketToClient(clientPair.second.id, queueItem.Data);
+                }
+            }
+            break;
+
+        default:
+            // 默认广播
+            for (const auto& clientPair : clientManager.getAllClients()) {
+                if (clientPair.second.isConnected) {
+                    sendPacketToClient(clientPair.second.id, queueItem.Data);
+                }
+            }
+            break;
         }
     }
 }

@@ -1,6 +1,7 @@
 #pragma once
 #include "Packet.h"
 #include "ClientManager.h"
+#include "CQueue.h"
 
 // Ç°ÏòÉùÃ÷
 class CCommand;

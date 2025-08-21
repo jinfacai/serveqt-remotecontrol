@@ -16,6 +16,9 @@
     <ClCompile Include="ClientManager.cpp">
       <Filter>源文件</Filter>
     </ClCompile>
+    <ClCompile Include="CQueue.cpp">
+      <Filter>源文件</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <Filter Include="头文件">
@@ -36,6 +39,9 @@
       <Filter>头文件</Filter>
     </ClInclude>
     <ClInclude Include="ClientManager.h">
+      <Filter>头文件</Filter>
+    </ClInclude>
+    <ClInclude Include="CQueue.h">
       <Filter>头文件</Filter>
     </ClInclude>
   </ItemGroup>

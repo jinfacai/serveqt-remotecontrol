@@ -77,6 +77,7 @@
   <ItemGroup>
     <ClCompile Include="ClientManager.cpp" />
     <ClCompile Include="Command.cpp" />
+    <ClCompile Include="CQueue.cpp" />
     <ClCompile Include="main.cpp" />
     <ClCompile Include="Packet.cpp" />
     <ClCompile Include="ServerSocket.cpp" />
@@ -84,6 +85,7 @@
   <ItemGroup>
     <ClInclude Include="ClientManager.h" />
     <ClInclude Include="Command.h" />
+    <ClInclude Include="CQueue.h" />
     <ClInclude Include="Packet.h" />
     <ClInclude Include="ServerSocket.h" />
   </ItemGroup>
